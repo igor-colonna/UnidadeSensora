@@ -1,0 +1,20 @@
+{
+    "python.autoComplete.extraPaths": [
+        "/home/rov/ros2_ws/install/my_py_pkg/lib/python3.12/site-packages",
+        "/home/rov/ros2_ws/install/my_robot_interfaces/lib/python3.12/site-packages",
+        "/home/rov/ros2_ws/install/microstrain_inertial_rqt/lib/python3.12/site-packages",
+        "/home/rov/ros2_ws/install/microstrain_inertial_msgs/lib/python3.12/site-packages",
+        "/home/rov/ros2_ws/install/imu_logger/lib/python3.12/site-packages",
+        "/home/rov/Documents/emul-js-rov/ros2_ws/install/rov_msgs/lib/python3.12/site-packages",
+        "/opt/ros/jazzy/lib/python3.12/site-packages"
+    ],
+    "python.analysis.extraPaths": [
+        "/home/rov/ros2_ws/install/my_py_pkg/lib/python3.12/site-packages",
+        "/home/rov/ros2_ws/install/my_robot_interfaces/lib/python3.12/site-packages",
+        "/home/rov/ros2_ws/install/microstrain_inertial_rqt/lib/python3.12/site-packages",
+        "/home/rov/ros2_ws/install/microstrain_inertial_msgs/lib/python3.12/site-packages",
+        "/home/rov/ros2_ws/install/imu_logger/lib/python3.12/site-packages",
+        "/home/rov/Documents/emul-js-rov/ros2_ws/install/rov_msgs/lib/python3.12/site-packages",
+        "/opt/ros/jazzy/lib/python3.12/site-packages"
+    ]
+}

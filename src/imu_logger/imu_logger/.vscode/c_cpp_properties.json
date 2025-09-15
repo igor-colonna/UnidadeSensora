@@ -1,0 +1,25 @@
+{
+  "configurations": [
+    {
+      "browse": {
+        "databaseFilename": "${default}",
+        "limitSymbolsToIncludedHeaders": false
+      },
+      "includePath": [
+        "/home/rov/Documents/emul-js-rov/ros2_ws/install/rov_msgs/include/**",
+        "/home/rov/ros2_ws/install/my_robot_interfaces/include/**",
+        "/home/rov/ros2_ws/install/microstrain_inertial_msgs/include/**",
+        "/opt/ros/jazzy/include/**",
+        "/home/rov/ros2_ws/src/microstrain_inertial/microstrain_inertial_driver/include/**",
+        "/home/rov/ros2_ws/src/my_cpp_pkg/include/**",
+        "/usr/include/**"
+      ],
+      "name": "ROS",
+      "intelliSenseMode": "gcc-arm64",
+      "compilerPath": "/usr/bin/gcc",
+      "cStandard": "gnu11",
+      "cppStandard": "c++14"
+    }
+  ],
+  "version": 4
+}

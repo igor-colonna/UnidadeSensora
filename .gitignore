@@ -1,0 +1,17 @@
+# Build directories
+build/
+devel/
+install/
+
+# Log files
+log/
+
+# Other generated files
+*.log
+*.pyc
+*.swp
+*~
+
+# Catkin/Colcon tools
+.catkin_tools/
+.colcon/
