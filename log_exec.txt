@@ -1,0 +1,40 @@
+nohup: ignoring input
+Traceback (most recent call last):
+  File "/home/rov/ros2_ws/install/imu_logger/lib/python3.12/site-packages/imu_logger/imu_logger_node.py", line 58, in main
+    
+  File "/opt/ros/jazzy/lib/python3.12/site-packages/rclpy/__init__.py", line 244, in spin
+    executor.spin_once()
+  File "/opt/ros/jazzy/lib/python3.12/site-packages/rclpy/executors.py", line 839, in spin_once
+    self._spin_once_impl(timeout_sec)
+  File "/opt/ros/jazzy/lib/python3.12/site-packages/rclpy/executors.py", line 834, in _spin_once_impl
+    raise handler.exception()
+  File "/opt/ros/jazzy/lib/python3.12/site-packages/rclpy/task.py", line 269, in __call__
+    self._handler.send(None)
+  File "/opt/ros/jazzy/lib/python3.12/site-packages/rclpy/executors.py", line 518, in handler
+    await call_coroutine()
+  File "/opt/ros/jazzy/lib/python3.12/site-packages/rclpy/executors.py", line 406, in _execute
+    await await_or_execute(sub.callback, *msg_tuple)
+  File "/opt/ros/jazzy/lib/python3.12/site-packages/rclpy/executors.py", line 111, in await_or_execute
+    return callback(*args)
+           ^^^^^^^^^^^^^^^
+  File "/home/rov/ros2_ws/install/imu_logger/lib/python3.12/site-packages/imu_logger/imu_logger_node.py", line 34, in listener_callback
+    'angular_velocity_x', 'angular_velocity_y', 'angular_velocity_z',
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+OSError: [Errno 28] No space left on device
+
+During handling of the above exception, another exception occurred:
+
+OSError: [Errno 28] No space left on device
+
+During handling of the above exception, another exception occurred:
+
+T[ros2run]: Process exited with failure 1
+"/home/rov/ros2_ws/install/imu_logger/lib/imu_logger/imu_logger_node", line 33, in <module>
+    sys.exit(load_entry_point('imu-logger==0.0.0', 'console_scripts', 'imu_logger_node')())
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/rov/ros2_ws/install/imu_logger/lib/python3.12/site-packages/imu_logger/imu_logger_node.py", line 62, in main
+    
+  File "/home/rov/ros2_ws/install/imu_logger/lib/python3.12/site-packages/imu_logger/imu_logger_node.py", line 51, in destroy_node
+    msg.angular_velocity.x,
+^^^^^^^^^^^^^^^^^
+OSError: [Errno 28] No space left on device

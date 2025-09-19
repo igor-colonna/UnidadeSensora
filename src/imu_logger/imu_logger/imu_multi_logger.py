@@ -2,7 +2,9 @@
 import os
 import csv
 import time
-import subprocess
+#import subprocess
+from queue import Queue, Full, Empty
+from threading import Event, Lock, Thread
 from typing import Dict, List, Optional, Tuple
 
 import rclpy
@@ -21,12 +23,12 @@ QOS_DEPTH = 10
 
 # Vídeo: 1280x720@30; H.264 com bitrate moderado para gravação longa
 VIDEO_WIDTH = 1280
-VIDEO_HEIGHT = 720
+VIDEO_HEIGHT =  720
 VIDEO_FPS = 30
 VIDEO_BITRATE = 4000  # kbps; ajuste conforme armazenamento/qualidade
 VIDEO_CODEC = 'h264'  # opções: h264, h265, mjpg, xvid
 VIDEO_CONTAINER = ''  # vazio => derivar do codec
-SYNC_SLOP_SEC = 0.02  # tolerância de sincronização (20 ms)
+SYNC_SLOP_SEC = 0.02  # to  lerância de sincronização (20 ms)
 
 
 def ros_time_to_ns(t: RosTime) -> int:
@@ -165,7 +167,7 @@ class OpenCvVideoWriter:
             return
         self.writer.write(frame_bgr)
         # Estimativa de bytes: bitrate_kbps -> bytes/s. Para 30 fps, bytes/frame ~ (bitrate*1000/8)/fps
-        est_bytes = int((self.bitrate_kbps * 1000 / 8) / max(1, self.fps))
+        est_bytes = int((self.bitrate_kbps) / max(1, self.fps))
         self.bytes_written += est_bytes
         if self.bytes_written >= MAX_BYTES:
             self._open_new_file()
@@ -193,6 +195,10 @@ class ImuMultiLogger(Node):
         self.declare_parameter('video_codec', VIDEO_CODEC)
         self.declare_parameter('video_container', VIDEO_CONTAINER)
         self.declare_parameter('sync_slop', SYNC_SLOP_SEC)
+        self.declare_parameter('sync_mode', 'approx')  # approx | camera_only
+        self.declare_parameter('stats_period', 5.0)
+        self.declare_parameter('warn_encode_ms', 25.0)
+        self.declare_parameter('enable_resize', True)
 
         self.imu_topic = self.get_parameter('imu_topic').get_parameter_value().string_value
         self.camera_topics = [s for s in self.get_parameter('camera_topics').get_parameter_value().string_array_value]
@@ -203,6 +209,13 @@ class ImuMultiLogger(Node):
         self.video_codec = str(self.get_parameter('video_codec').value or 'h264')
         self.video_container = str(self.get_parameter('video_container').value or '')
         self.sync_slop = float(self.get_parameter('sync_slop').value)
+        self.sync_mode = str(self.get_parameter('sync_mode').value or 'approx').lower()
+        if self.sync_mode not in ('approx', 'camera_only'):
+            self.get_logger().warn(f"sync_mode='{self.sync_mode}' inválido, usando 'approx'")
+            self.sync_mode = 'approx'
+        self.stats_period = max(0.5, float(self.get_parameter('stats_period').value))
+        self.warn_encode_ms = float(self.get_parameter('warn_encode_ms').value)
+        self.enable_resize = bool(self.get_parameter('enable_resize').value)
 
         qos = QoSProfile(depth=QOS_DEPTH)
 
@@ -235,9 +248,46 @@ class ImuMultiLogger(Node):
         # Câmeras: writer de vídeo + CSV timestamps por câmera
         self.camera_writers: Dict[str, OpenCvVideoWriter] = {}
         self.camera_csv: Dict[str, CsvRotator] = {}
+        self._stats_lock = Lock()
+        self.camera_stats: Dict[str, Dict[str, float]] = {
+            topic: {
+                'received': 0,
+                'written': 0,
+                'encode_time_total': 0.0,
+                'encode_time_max': 0.0,
+                'encode_warns': 0,
+                'sync_delay_total_ms': 0.0,
+                'sync_delay_max_ms': 0.0,
+                'sync_pairs': 0,
+                'resize_drops': 0,
+                'conversion_drops': 0,
+            }
+            for topic in self.camera_topics
+        }
         self.syncs: List[ApproximateTimeSynchronizer] = []
-        # Um subscriber de IMU compartilhado
-        self.imu_sub_mf = MfSubscriber(self, Imu, self.imu_topic, qos_profile=qos)
+        # # Um subscriber de IMU compartilhado
+        # self.imu_sub_mf = MfSubscriber(self, Imu, self.imu_topic, qos_profile=qos)
+
+        self._cam_monitors: List = []
+        self._camera_only_subs = []
+        self._resize_warned = False
+        self._stats_last_time = self.get_clock().now()
+        self._imu_since_log = 0
+        self._merged_lock = Lock()
+        self.camera_workers: Dict[str, 'CameraWorker'] = {}
+        self._frame_counters: Dict[str, int] = {topic: 0 for topic in self.camera_topics}
+        self._encode_warn_last_log: Dict[str, float] = {topic: 0.0 for topic in self.camera_topics}
+        self._camera_last_stamp: Dict[str, Optional[RosTime]] = {topic: None for topic in self.camera_topics}
+        self._imu_last_stamp: Optional[RosTime] = None
+
+        # Um subscriber de IMU compartilhado (usado no modo approx)
+        self.imu_sub_mf: Optional[MfSubscriber] = None
+        if self.sync_mode == 'approx':
+            self.imu_sub_mf = MfSubscriber(self, Imu, self.imu_topic, qos_profile=qos)
+            self.imu_sub_mf.registerCallback(self._imu_monitor_cb)
+        else:
+            # Inscrição direta apenas para monitoramento de taxa
+            self._imu_direct_sub = self.create_subscription(Imu, self.imu_topic, self._imu_monitor_cb, qos)
 
         for topic in self.camera_topics:
             cam_name = topic.strip('/').replace('/', '_') or 'camera'
@@ -257,16 +307,33 @@ class ImuMultiLogger(Node):
                 prefix=f'{cam_name}_timestamps',
                 header=['sec', 'nanosec', 'frame_index']
             )
-            cam_sub = MfSubscriber(self, Image, topic, qos_profile=qos)
-            ats = ApproximateTimeSynchronizer([self.imu_sub_mf, cam_sub], queue_size=QOS_DEPTH, slop=self.sync_slop)
-            ats.registerCallback(self._make_sync_cb(topic))
-            self.syncs.append(ats)
+            # cam_sub = MfSubscriber(self, Image, topic, qos_profile=qos)
+            # ats = ApproximateTimeSynchronizer([self.imu_sub_mf, cam_sub], queue_size=QOS_DEPTH, slop=self.sync_slop)
+            # ats.registerCallback(self._make_sync_cb(topic))
+            # self.syncs.append(ats)
+            if self.sync_mode == 'approx' and self.imu_sub_mf is not None:
+                cam_sub = MfSubscriber(self, Image, topic, qos_profile=qos)
+                monitor_cb = self._make_camera_monitor_cb(topic)
+                cam_sub.registerCallback(monitor_cb)
+                self._cam_monitors.append(monitor_cb)
+                ats = ApproximateTimeSynchronizer([self.imu_sub_mf, cam_sub], queue_size=QOS_DEPTH, slop=self.sync_slop)
+                ats.registerCallback(self._make_sync_cb(topic))
+                self.syncs.append(ats)
+            else:
+                sub = self.create_subscription(Image, topic, self._make_camera_only_cb(topic), qos)
+                self._camera_only_subs.append(sub)
 
-        self.get_logger().info(f'IMU em {self.imu_topic}; Câmeras: {self.camera_topics}; codec={self.video_codec}; slop={self.sync_slop}s')
+
+        # self.get_logger().info(f'IMU em {self.imu_topic}; Câmeras: {self.camera_topics}; codec={self.video_codec}; slop={self.sync_slop}s')
+        self.stats_timer = self.create_timer(self.stats_period, self._log_stats)
+        self.get_logger().info(
+            f"IMU em {self.imu_topic}; Câmeras: {self.camera_topics}; codec={self.video_codec}; "
+            f"slop={self.sync_slop}s; sync_mode={self.sync_mode}"
+        )
 
     def _resize_to_target(self, img_msg: Image):
         if cv2 is None:
-            return None
+            return None, 'cv2_missing'
         # Converte sensor_msgs/Image em ndarray BGR sem cv_bridge para evitar overhead
         if img_msg.encoding in ('bgr8', 'rgb8'):
             import numpy as np
@@ -282,33 +349,40 @@ class ImuMultiLogger(Node):
                 bridge = CvBridge()
                 frame = bridge.imgmsg_to_cv2(img_msg, desired_encoding='bgr8')
             except Exception:
-                return None
+                return None, 'conversion_failed'
         if frame.shape[1] != self.video_width or frame.shape[0] != self.video_height:
+            if not self.enable_resize:
+                if not self._resize_warned:
+                    self.get_logger().warn(
+                        'Frame com resolução diferente da configurada e redimensionamento desativado; descartando frames '
+                        'para evitar reamostragem custosa'
+                    )
+                    self._resize_warned = True
+                return None, 'resize_disabled'
             frame = cv2.resize(frame, (self.video_width, self.video_height), interpolation=cv2.INTER_AREA)
-        return frame
+        return frame, 'ok'
 
     def _make_sync_cb(self, topic: str):
         def cb(imu_msg: Imu, img_msg: Image):
-            writer = self.camera_writers.get(topic)
-            csv_logger = self.camera_csv.get(topic)
-            if writer is None or csv_logger is None:
+            frame_idx = self._handle_frame(topic, img_msg)
+            if frame_idx is None:
                 return
-            # vídeo
-            frame = self._resize_to_target(img_msg)
-            if frame is None:
-                return
-            writer.write_frame(frame)
-            # contador de frame por tópico
-            idx_attr = f'_frame_idx_{topic}'
-            cnt = getattr(self, idx_attr, 0)
-            csv_logger.write_row([img_msg.header.stamp.sec, img_msg.header.stamp.nanosec, cnt])
-            setattr(self, idx_attr, cnt + 1)
+            delay_ms = abs(ros_time_to_ns(img_msg.header.stamp) - ros_time_to_ns(imu_msg.header.stamp)) / 1_000_000.0
+            with self._stats_lock:
+                stats = self.camera_stats.get(topic)
+                if stats is not None:
+                    stats['sync_pairs'] += 1
+                    stats['sync_delay_total_ms'] += delay_ms
+                    if delay_ms > stats['sync_delay_max_ms']:
+                        stats['sync_delay_max_ms'] = delay_ms
             # linha unificada (IMU+Cam) usando o timestamp do frame
+            writer = self.camera_writers.get(topic)
+            current_path = writer.current_path if writer else ''
             merged_row = [
                 'imu_cam',
                 topic,
                 img_msg.header.stamp.sec, img_msg.header.stamp.nanosec,
-                writer.current_path or '', cnt,
+                current_path or '', frame_idx,
                 imu_msg.orientation.x, imu_msg.orientation.y, imu_msg.orientation.z, imu_msg.orientation.w,
                 *imu_msg.orientation_covariance,
                 imu_msg.angular_velocity.x, imu_msg.angular_velocity.y, imu_msg.angular_velocity.z,
@@ -316,8 +390,139 @@ class ImuMultiLogger(Node):
                 imu_msg.linear_acceleration.x, imu_msg.linear_acceleration.y, imu_msg.linear_acceleration.z,
                 *imu_msg.linear_acceleration_covariance
             ]
-            self.merged_csv.write_row(merged_row)
+            with self._merged_lock:
+                self.merged_csv.write_row(merged_row)
         return cb
+
+    def _increment_camera_received(self, topic: str, stamp: RosTime) -> None:
+        with self._stats_lock:
+            stats = self.camera_stats.get(topic)
+            if stats is not None:
+                stats['received'] += 1
+        self._camera_last_stamp[topic] = stamp
+
+    def _register_drop(self, topic: str, reason: str) -> None:
+        with self._stats_lock:
+            stats = self.camera_stats.get(topic)
+            if stats is None:
+                return
+            if reason == 'resize_disabled':
+                stats['resize_drops'] += 1
+            else:
+                stats['conversion_drops'] += 1
+
+    def _handle_frame(self, topic: str, img_msg: Image) -> Optional[int]:
+        writer = self.camera_writers.get(topic)
+        csv_logger = self.camera_csv.get(topic)
+        if writer is None or csv_logger is None:
+            return None
+        frame, reason = self._resize_to_target(img_msg)
+        if frame is None:
+            self._register_drop(topic, reason)
+            return None
+        start = time.perf_counter()
+        writer.write_frame(frame)
+        encode_ms = (time.perf_counter() - start) * 1000.0
+        frame_idx = self._frame_counters[topic]
+        csv_logger.write_row([img_msg.header.stamp.sec, img_msg.header.stamp.nanosec, frame_idx])
+        self._frame_counters[topic] = frame_idx + 1
+        with self._stats_lock:
+            stats = self.camera_stats.get(topic)
+            if stats is not None:
+                stats['written'] += 1
+                stats['encode_time_total'] += encode_ms
+                if encode_ms > stats['encode_time_max']:
+                    stats['encode_time_max'] = encode_ms
+        if encode_ms > self.warn_encode_ms:
+            now_mono = time.monotonic()
+            last = self._encode_warn_last_log.get(topic, 0.0)
+            if now_mono - last >= 1.0:
+                self.get_logger().warn(
+                    f'[{topic}] encode levou {encode_ms:.1f} ms (limite {self.warn_encode_ms:.1f} ms)'
+                )
+                self._encode_warn_last_log[topic] = now_mono
+            with self._stats_lock:
+                stats = self.camera_stats.get(topic)
+                if stats is not None:
+                    stats['encode_warns'] += 1
+        return frame_idx
+
+    def _make_camera_monitor_cb(self, topic: str):
+        def cb(img_msg: Image) -> None:
+            self._increment_camera_received(topic, img_msg.header.stamp)
+        return cb
+
+    def _make_camera_only_cb(self, topic: str):
+        def cb(img_msg: Image) -> None:
+            self._increment_camera_received(topic, img_msg.header.stamp)
+            self._handle_frame(topic, img_msg)
+        return cb
+
+    def _imu_monitor_cb(self, imu_msg: Imu) -> None:
+        with self._stats_lock:
+            self._imu_since_log += 1
+        self._imu_last_stamp = imu_msg.header.stamp
+
+    def _log_stats(self) -> None:
+        now = self.get_clock().now()
+        elapsed_ns = (now - self._stats_last_time).nanoseconds
+        if elapsed_ns <= 0:
+            return
+        elapsed = elapsed_ns / 1_000_000_000.0
+        lines: List[str] = []
+        with self._stats_lock:
+            imu_count = self._imu_since_log
+            self._imu_since_log = 0
+            for topic, stats in self.camera_stats.items():
+                received = int(stats['received'])
+                written = int(stats['written'])
+                resize_drops = int(stats['resize_drops'])
+                conversion_drops = int(stats['conversion_drops'])
+                other_drops = max(0, received - written - resize_drops - conversion_drops)
+                avg_encode = (stats['encode_time_total'] / written) if written else 0.0
+                line = (
+                    f"{topic}: recv={received/elapsed:.1f} fps ({received}), "
+                    f"written={written/elapsed:.1f} fps ({written}), "
+                    f"avg_enc={avg_encode:.1f} ms, max_enc={stats['encode_time_max']:.1f} ms"
+                )
+                if stats['sync_pairs']:
+                    avg_sync = stats['sync_delay_total_ms'] / stats['sync_pairs']
+                    line += f", sync_avg={avg_sync:.1f} ms, sync_max={stats['sync_delay_max_ms']:.1f} ms"
+                if stats['encode_warns']:
+                    line += f", enc_warns={int(stats['encode_warns'])}"
+                if resize_drops:
+                    line += f", resize_drop={resize_drops}"
+                if conversion_drops:
+                    line += f", convert_drop={conversion_drops}"
+                if other_drops:
+                    line += f", other_drop={other_drops}"
+                last_stamp = self._camera_last_stamp.get(topic)
+                if last_stamp is not None:
+                    age_s = (now.nanoseconds - ros_time_to_ns(last_stamp)) / 1_000_000_000.0
+                    line += f", age={age_s:.2f}s"
+                lines.append(line)
+                stats.update({
+                    'received': 0,
+                    'written': 0,
+                    'encode_time_total': 0.0,
+                    'encode_time_max': 0.0,
+                    'encode_warns': 0,
+                    'sync_delay_total_ms': 0.0,
+                    'sync_delay_max_ms': 0.0,
+                    'sync_pairs': 0,
+                    'resize_drops': 0,
+                    'conversion_drops': 0,
+                })
+        imu_rate = imu_count / elapsed
+        imu_line = f'IMU: {imu_rate:.1f} Hz ({imu_count})'
+        if self._imu_last_stamp is not None:
+            imu_line += (
+                f", last_ts={self._imu_last_stamp.sec}.{self._imu_last_stamp.nanosec:09d}"
+            )
+        lines.insert(0, imu_line)
+        self._stats_last_time = now
+        if lines:
+            self.get_logger().info(' | '.join(lines))
 
     def destroy_node(self):
         try:
